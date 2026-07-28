@@ -125,7 +125,7 @@ def get_window_range(values, window_size, mode):
     start = max(1, end - window_size + 1)
     return start, end
 
-def make_summary_record(session_name, start_rotation, latest):
+def make_summary_record(session_name, start_rotation, latest, result_data):
     return {
         "保存名": session_name,
         "保存時刻": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -136,6 +136,13 @@ def make_summary_record(session_name, start_rotation, latest):
         "累計/k": round(float(latest["累計/k"]), 2),
         "直近5k": round(float(latest["直近5k"]), 2),
         "直近10k": round(float(latest["直近10k"]), 2),
+        "初当たり回数": result_data["初当たり回数"],
+        "確変突入回数": result_data["確変突入回数"],
+        "単発回数": result_data["単発回数"],
+        "総当たり回数": result_data["総当たり回数"],
+        "使用玉数": result_data["使用玉数"],
+        "獲得玉数": result_data["獲得玉数"],
+        "差玉": result_data["差玉"],
     }
 
 if "current_values" not in st.session_state:
@@ -143,6 +150,16 @@ if "current_values" not in st.session_state:
 
 if "saved_sessions" not in st.session_state:
     st.session_state.saved_sessions = []
+
+for key in ["first_hits", "kakuhen_hits", "total_hits", "earned_balls"]:
+    if key not in st.session_state:
+        st.session_state[key] = 0
+
+if st.session_state.pop("reset_result_inputs", False):
+    st.session_state.first_hits = 0
+    st.session_state.kakuhen_hits = 0
+    st.session_state.total_hits = 0
+    st.session_state.earned_balls = 0
 
 st.markdown("### 現在の実戦")
 
@@ -231,24 +248,84 @@ else:
     col5.metric("直近10k", f"{latest['直近10k']:.2f}")
     col6.metric("累計回転", f"{int(latest['累計回転'])}")
 
+    st.markdown("### 実戦結果")
+
+    result_col1, result_col2 = st.columns(2)
+    with result_col1:
+        first_hits = st.number_input(
+            "初当たり回数",
+            min_value=0,
+            step=1,
+            key="first_hits",
+        )
+        total_hits = st.number_input(
+            "総当たり回数",
+            min_value=0,
+            step=1,
+            key="total_hits",
+        )
+
+    with result_col2:
+        kakuhen_hits = st.number_input(
+            "確変突入回数",
+            min_value=0,
+            step=1,
+            key="kakuhen_hits",
+        )
+        earned_balls = st.number_input(
+            "獲得玉数（出玉カード）",
+            min_value=0,
+            step=1,
+            key="earned_balls",
+        )
+
+    single_hits = max(0, int(first_hits) - int(kakuhen_hits))
+    used_balls = int(latest["累計投資k"]) * 250
+    ball_difference = int(earned_balls) - used_balls
+
+    result_metric1, result_metric2, result_metric3 = st.columns(3)
+    result_metric1.metric("単発回数（自動）", f"{single_hits}回")
+    result_metric2.metric("使用玉数（自動）", f"{used_balls:,}玉")
+    result_metric3.metric("差玉（自動）", f"{ball_difference:+,}玉")
+
+    result_is_valid = True
+    if kakuhen_hits > first_hits:
+        st.error("確変突入回数は、初当たり回数以下で入力してください。")
+        result_is_valid = False
+    if total_hits < first_hits:
+        st.error("総当たり回数は、初当たり回数以上で入力してください。")
+        result_is_valid = False
+
+    result_data = {
+        "初当たり回数": int(first_hits),
+        "確変突入回数": int(kakuhen_hits),
+        "単発回数": single_hits,
+        "総当たり回数": int(total_hits),
+        "使用玉数": used_balls,
+        "獲得玉数": int(earned_balls),
+        "差玉": ball_difference,
+    }
+
     save_col, reset_col = st.columns(2)
     with save_col:
-        if st.button("この実戦を保存して次へ"):
+        if st.button("この実戦を保存して次へ", disabled=not result_is_valid):
             detail_to_save = calc_detail.copy()
             detail_to_save.insert(0, "保存名", session_name)
             detail_to_save.insert(1, "開始回転数", int(start_rotation))
             detail_to_save.insert(2, "保存時刻", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
             st.session_state.saved_sessions.append({
-                "summary": make_summary_record(session_name, start_rotation, latest),
+                "summary": make_summary_record(session_name, start_rotation, latest, result_data),
                 "detail": detail_to_save,
             })
             st.session_state.current_values = blank_values(MAX_ROWS)
+            st.session_state.reset_result_inputs = True
             st.rerun()
 
     with reset_col:
         if st.button("保存せず入力をリセット"):
             st.session_state.current_values = blank_values(MAX_ROWS)
+            st.session_state.reset_result_inputs = True
             st.rerun()
 
     show_graph = st.checkbox("グラフを表示する", value=False)
