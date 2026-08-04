@@ -2,7 +2,9 @@
 import streamlit as st
 import pandas as pd
 import altair as alt
+import json
 from datetime import datetime
+from streamlit_local_storage import LocalStorage
 
 st.set_page_config(
     page_title="回転率チェッカー",
@@ -36,6 +38,7 @@ st.title("🎰 回転率チェッカー")
 st.caption("開始回転数を入れ、表の「現在回転数」だけ入力します。ほかの列は自動計算です。")
 
 MAX_ROWS = 150
+LOCAL_STORAGE_KEY = "kaiten_checker_draft_v1"
 
 def blank_values(n=MAX_ROWS):
     return [None] * n
@@ -145,8 +148,79 @@ def make_summary_record(session_name, start_rotation, latest, result_data):
         "差玉": result_data["差玉"],
     }
 
+def make_draft_payload():
+    """入力途中の実戦をブラウザへ保存できる形にまとめる。"""
+    return {
+        "version": 1,
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "session_name": st.session_state.get("session_name", "実戦1"),
+        "start_rotation": int(st.session_state.get("start_rotation", 0)),
+        "current_values": adjust_values(
+            st.session_state.get("current_values", blank_values(MAX_ROWS)),
+            MAX_ROWS,
+        ),
+        "first_hits": int(st.session_state.get("first_hits", 0)),
+        "kakuhen_hits": int(st.session_state.get("kakuhen_hits", 0)),
+        "total_hits": int(st.session_state.get("total_hits", 0)),
+        "earned_balls": int(st.session_state.get("earned_balls", 0)),
+    }
+
+def parse_draft(raw_draft):
+    """localStorageの値を検証し、復元可能な辞書として返す。"""
+    if not raw_draft:
+        return None
+
+    try:
+        draft = json.loads(raw_draft) if isinstance(raw_draft, str) else raw_draft
+        if not isinstance(draft, dict) or draft.get("version") != 1:
+            return None
+
+        return {
+            "session_name": str(draft.get("session_name", "実戦1")),
+            "start_rotation": max(0, int(draft.get("start_rotation", 0))),
+            "current_values": [
+                None if value is None else int(value)
+                for value in adjust_values(draft.get("current_values", []), MAX_ROWS)
+            ],
+            "first_hits": max(0, int(draft.get("first_hits", 0))),
+            "kakuhen_hits": max(0, int(draft.get("kakuhen_hits", 0))),
+            "total_hits": max(0, int(draft.get("total_hits", 0))),
+            "earned_balls": max(0, int(draft.get("earned_balls", 0))),
+            "saved_at": str(draft.get("saved_at", "")),
+        }
+    except (TypeError, ValueError):
+        return None
+
+def reset_current_session():
+    st.session_state.current_values = blank_values(MAX_ROWS)
+    st.session_state.session_name = "実戦1"
+    st.session_state.start_rotation = 0
+    st.session_state.first_hits = 0
+    st.session_state.kakuhen_hits = 0
+    st.session_state.total_hits = 0
+    st.session_state.earned_balls = 0
+
+local_storage = LocalStorage(key="kaiten_checker_local_storage")
+
+if "draft_restored" not in st.session_state:
+    restored_draft = parse_draft(local_storage.getItem(LOCAL_STORAGE_KEY))
+    if restored_draft:
+        for key in [
+            "session_name", "start_rotation", "current_values", "first_hits",
+            "kakuhen_hits", "total_hits", "earned_balls",
+        ]:
+            st.session_state[key] = restored_draft[key]
+        st.session_state.restore_notice = restored_draft.get("saved_at", "")
+    st.session_state.draft_restored = True
+
 if "current_values" not in st.session_state:
     st.session_state.current_values = blank_values(MAX_ROWS)
+
+if "session_name" not in st.session_state:
+    st.session_state.session_name = "実戦1"
+
+if "start_rotation" not in st.session_state:
+    st.session_state.start_rotation = 0
 
 if "saved_sessions" not in st.session_state:
     st.session_state.saved_sessions = []
@@ -155,21 +229,25 @@ for key in ["first_hits", "kakuhen_hits", "total_hits", "earned_balls"]:
     if key not in st.session_state:
         st.session_state[key] = 0
 
-if st.session_state.pop("reset_result_inputs", False):
-    st.session_state.first_hits = 0
-    st.session_state.kakuhen_hits = 0
-    st.session_state.total_hits = 0
-    st.session_state.earned_balls = 0
+if st.session_state.pop("reset_current_session", False):
+    reset_current_session()
+
+if restore_notice := st.session_state.pop("restore_notice", None):
+    st.success(f"前回の入力を復元しました（最終保存：{restore_notice}）")
 
 st.markdown("### 現在の実戦")
 
-session_name = st.text_input("保存名", value="実戦1", help="例：6/18 エヴァ、A店リゼロなど")
+session_name = st.text_input(
+    "保存名",
+    help="例：6/18 エヴァ、A店リゼロなど",
+    key="session_name",
+)
 
 start_rotation = st.number_input(
     "開始回転数",
     min_value=0,
     step=1,
-    value=0,
+    key="start_rotation",
 )
 
 st.session_state.current_values = adjust_values(st.session_state.current_values, MAX_ROWS)
@@ -318,14 +396,12 @@ else:
                 "summary": make_summary_record(session_name, start_rotation, latest, result_data),
                 "detail": detail_to_save,
             })
-            st.session_state.current_values = blank_values(MAX_ROWS)
-            st.session_state.reset_result_inputs = True
+            st.session_state.reset_current_session = True
             st.rerun()
 
     with reset_col:
         if st.button("保存せず入力をリセット"):
-            st.session_state.current_values = blank_values(MAX_ROWS)
-            st.session_state.reset_result_inputs = True
+            st.session_state.reset_current_session = True
             st.rerun()
 
     show_graph = st.checkbox("グラフを表示する", value=False)
@@ -392,4 +468,13 @@ else:
         st.session_state.saved_sessions = []
         st.rerun()
 
-st.caption("※ 入力中は最新付近表示がおすすめです。この保存はブラウザセッション内の一時保存なので、必要ならCSVダウンロードしてください。")
+draft_json = json.dumps(make_draft_payload(), ensure_ascii=False)
+if draft_json != st.session_state.get("last_saved_draft"):
+    local_storage.setItem(
+        LOCAL_STORAGE_KEY,
+        draft_json,
+        key="kaiten_checker_autosave",
+    )
+    st.session_state.last_saved_draft = draft_json
+
+st.caption("※ 入力途中の内容は、この端末のブラウザへ自動保存されます。Safariの履歴・Webサイトデータを消去すると復元できません。保存済みデータは必要に応じてCSVダウンロードしてください。")

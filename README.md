@@ -1,1 +1,6 @@
 # kaiten-checker
+
+スマホで1kごとの回転数と実戦結果を記録するStreamlitアプリです。
+
+入力途中の内容はブラウザのlocalStorageへ自動保存され、スマホの暗転や
+Streamlitの再接続後に同じブラウザで開くと自動復元されます。
