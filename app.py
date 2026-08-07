@@ -37,102 +37,111 @@ h2, h3 {
 st.title("🎰 回転率チェッカー")
 st.caption("開始回転数を入れ、表の「現在回転数」だけ入力します。ほかの列は自動計算です。")
 
-MAX_ROWS = 150
+MAX_EVENTS = 300
 LOCAL_STORAGE_KEY = "kaiten_checker_draft_v1"
 
-def blank_values(n=MAX_ROWS):
-    return [None] * n
+def normalize_events(events):
+    """保存値を安全なイベント列へ整形する。"""
+    normalized = []
+    previous = None
+    for raw in list(events or [])[:MAX_EVENTS]:
+        if not isinstance(raw, dict):
+            continue
+        event_type = raw.get("type")
+        if event_type not in ["start", "1k"]:
+            continue
+        try:
+            value = max(0, int(raw.get("value")))
+        except (TypeError, ValueError):
+            continue
+        if event_type == "1k" and (previous is None or value <= previous):
+            continue
+        normalized.append({"type": event_type, "value": value})
+        previous = value
+    return normalized
 
-def adjust_values(values, n):
-    values = list(values)
-    if len(values) < n:
-        values += [None] * (n - len(values))
-    return values[:n]
+def migrate_v1_events(start_rotation, current_values):
+    """旧版の開始回転数＋入力表を新しいイベント列へ変換する。"""
+    filled_values = [value for value in list(current_values or []) if value is not None and not pd.isna(value)]
+    if int(start_rotation) == 0 and not filled_values:
+        return []
 
-def last_filled_k(values):
-    last = 0
-    for i, v in enumerate(values, start=1):
-        if v is not None and not pd.isna(v):
-            last = i
-    return last
+    events = [{"type": "start", "value": max(0, int(start_rotation))}]
+    previous = events[0]["value"]
+    for raw in filled_values:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > previous:
+            events.append({"type": "1k", "value": value})
+            previous = value
+    return events
 
-def calculate_all(current_values, start_rotation):
-    values = adjust_values(current_values, MAX_ROWS)
+def calculate_all(events):
+    """区間開始と1k確定の履歴から全指標を再計算する。"""
+    rows = []
+    previous = None
+    first_start = None
+    segment = 0
+    investment_k = 0
+    total_rotation = 0
+    per_k_values = []
+    latest = None
 
-    base = pd.DataFrame({
-        "投資k": list(range(1, MAX_ROWS + 1)),
-        "現在回転数": values,
-    })
+    for record_no, event in enumerate(normalize_events(events), start=1):
+        value = int(event["value"])
+        if event["type"] == "start":
+            segment += 1
+            previous = value
+            if first_start is None:
+                first_start = value
+            rows.append({
+                "記録No": record_no,
+                "区間": segment,
+                "区分": "開始",
+                "投資k": investment_k,
+                "現在回転数": value,
+                "今回1k": None,
+                "累計/k": round(total_rotation / investment_k, 2) if investment_k else None,
+                "直近5k": round(sum(per_k_values[-5:]) / len(per_k_values[-5:]), 2) if per_k_values else None,
+                "直近10k": round(sum(per_k_values[-10:]) / len(per_k_values[-10:]), 2) if per_k_values else None,
+                "累計回転": total_rotation,
+            })
+            continue
 
-    base["今回1k"] = None
-    base["累計/k"] = None
-    base["直近5k"] = None
-    base["直近10k"] = None
-    base["累計回転"] = None
+        if previous is None or value <= previous:
+            continue
+        this_1k = value - previous
+        previous = value
+        investment_k += 1
+        total_rotation += this_1k
+        per_k_values.append(this_1k)
+        row = {
+            "記録No": record_no,
+            "区間": segment,
+            "区分": "1k確定",
+            "投資k": investment_k,
+            "現在回転数": value,
+            "今回1k": this_1k,
+            "累計/k": round(total_rotation / investment_k, 2),
+            "直近5k": round(sum(per_k_values[-5:]) / len(per_k_values[-5:]), 2),
+            "直近10k": round(sum(per_k_values[-10:]) / len(per_k_values[-10:]), 2),
+            "累計回転": total_rotation,
+            "開始回転数": first_start,
+            "累計投資k": investment_k,
+        }
+        rows.append(row)
+        latest = pd.Series(row)
 
-    valid = base.dropna(subset=["現在回転数"]).copy()
-    if valid.empty:
-        return base, None, pd.DataFrame()
+    history = pd.DataFrame(rows)
+    return history, latest, history.copy()
 
-    valid["現在回転数"] = pd.to_numeric(valid["現在回転数"], errors="coerce")
-    valid = valid.dropna(subset=["現在回転数"]).copy()
-    valid["現在回転数"] = valid["現在回転数"].astype(int)
-
-    valid = valid[valid["現在回転数"] >= start_rotation].copy()
-    if valid.empty:
-        return base, None, pd.DataFrame()
-
-    valid = valid.sort_values("投資k").reset_index(drop=True)
-
-    previous_values = [start_rotation] + valid["現在回転数"].tolist()[:-1]
-    valid["前回回転数"] = previous_values
-    valid["今回1k"] = valid["現在回転数"] - valid["前回回転数"]
-    valid["累計投資k"] = range(1, len(valid) + 1)
-    valid["累計回転"] = valid["現在回転数"] - start_rotation
-    valid["累計/k"] = valid["累計回転"] / valid["累計投資k"]
-    valid["直近5k"] = valid["今回1k"].rolling(window=5, min_periods=1).mean()
-    valid["直近10k"] = valid["今回1k"].rolling(window=10, min_periods=1).mean()
-
-    out = base.copy()
-    for i, row in valid.iterrows():
-        source_k = int(row["投資k"])
-        idx = out.index[out["投資k"] == source_k][0]
-        out.loc[idx, "今回1k"] = int(row["今回1k"])
-        out.loc[idx, "累計/k"] = round(float(row["累計/k"]), 2)
-        out.loc[idx, "直近5k"] = round(float(row["直近5k"]), 2)
-        out.loc[idx, "直近10k"] = round(float(row["直近10k"]), 2)
-        out.loc[idx, "累計回転"] = int(row["累計回転"])
-
-    latest = valid.iloc[-1]
-    calc_detail = valid[[
-        "累計投資k", "現在回転数", "今回1k", "累計/k", "直近5k", "直近10k", "累計回転"
-    ]].copy()
-    calc_detail["累計/k"] = calc_detail["累計/k"].round(2)
-    calc_detail["直近5k"] = calc_detail["直近5k"].round(2)
-    calc_detail["直近10k"] = calc_detail["直近10k"].round(2)
-
-    return out, latest, calc_detail
-
-def get_window_range(values, window_size, mode):
-    if mode == "全体を表示":
-        return 1, MAX_ROWS
-
-    last = last_filled_k(values)
-    if last == 0:
-        start = 1
-    else:
-        # 最新入力が下の方に来るように、少し手前から表示
-        start = max(1, last - window_size + 6)
-
-    end = min(MAX_ROWS, start + window_size - 1)
-    start = max(1, end - window_size + 1)
-    return start, end
-
-def make_summary_record(session_name, start_rotation, latest, result_data):
+def make_summary_record(session_name, latest, result_data):
     return {
         "保存名": session_name,
         "保存時刻": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "開始回転数": int(start_rotation),
+        "開始回転数": int(latest["開始回転数"]),
         "累計投資k": int(latest["累計投資k"]),
         "最終回転数": int(latest["現在回転数"]),
         "累計回転": int(latest["累計回転"]),
@@ -151,14 +160,10 @@ def make_summary_record(session_name, start_rotation, latest, result_data):
 def make_draft_payload():
     """入力途中の実戦をブラウザへ保存できる形にまとめる。"""
     return {
-        "version": 1,
+        "version": 2,
         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "session_name": st.session_state.get("session_name", "実戦1"),
-        "start_rotation": int(st.session_state.get("start_rotation", 0)),
-        "current_values": adjust_values(
-            st.session_state.get("current_values", blank_values(MAX_ROWS)),
-            MAX_ROWS,
-        ),
+        "events": normalize_events(st.session_state.get("events", [])),
         "first_hits": int(st.session_state.get("first_hits", 0)),
         "kakuhen_hits": int(st.session_state.get("kakuhen_hits", 0)),
         "total_hits": int(st.session_state.get("total_hits", 0)),
@@ -172,16 +177,20 @@ def parse_draft(raw_draft):
 
     try:
         draft = json.loads(raw_draft) if isinstance(raw_draft, str) else raw_draft
-        if not isinstance(draft, dict) or draft.get("version") != 1:
+        if not isinstance(draft, dict) or draft.get("version") not in [1, 2]:
             return None
+
+        if draft.get("version") == 1:
+            events = migrate_v1_events(
+                draft.get("start_rotation", 0),
+                draft.get("current_values", []),
+            )
+        else:
+            events = normalize_events(draft.get("events", []))
 
         return {
             "session_name": str(draft.get("session_name", "実戦1")),
-            "start_rotation": max(0, int(draft.get("start_rotation", 0))),
-            "current_values": [
-                None if value is None else int(value)
-                for value in adjust_values(draft.get("current_values", []), MAX_ROWS)
-            ],
+            "events": events,
             "first_hits": max(0, int(draft.get("first_hits", 0))),
             "kakuhen_hits": max(0, int(draft.get("kakuhen_hits", 0))),
             "total_hits": max(0, int(draft.get("total_hits", 0))),
@@ -192,9 +201,9 @@ def parse_draft(raw_draft):
         return None
 
 def reset_current_session():
-    st.session_state.current_values = blank_values(MAX_ROWS)
+    st.session_state.events = []
     st.session_state.session_name = "実戦1"
-    st.session_state.start_rotation = 0
+    st.session_state.rotation_input = 0
     st.session_state.first_hits = 0
     st.session_state.kakuhen_hits = 0
     st.session_state.total_hits = 0
@@ -206,21 +215,21 @@ if "draft_restored" not in st.session_state:
     restored_draft = parse_draft(local_storage.getItem(LOCAL_STORAGE_KEY))
     if restored_draft:
         for key in [
-            "session_name", "start_rotation", "current_values", "first_hits",
+            "session_name", "events", "first_hits",
             "kakuhen_hits", "total_hits", "earned_balls",
         ]:
             st.session_state[key] = restored_draft[key]
         st.session_state.restore_notice = restored_draft.get("saved_at", "")
     st.session_state.draft_restored = True
 
-if "current_values" not in st.session_state:
-    st.session_state.current_values = blank_values(MAX_ROWS)
+if "events" not in st.session_state:
+    st.session_state.events = []
 
 if "session_name" not in st.session_state:
     st.session_state.session_name = "実戦1"
 
-if "start_rotation" not in st.session_state:
-    st.session_state.start_rotation = 0
+if "rotation_input" not in st.session_state:
+    st.session_state.rotation_input = 0
 
 if "saved_sessions" not in st.session_state:
     st.session_state.saved_sessions = []
@@ -231,6 +240,9 @@ for key in ["first_hits", "kakuhen_hits", "total_hits", "earned_balls"]:
 
 if st.session_state.pop("reset_current_session", False):
     reset_current_session()
+
+if "restore_rotation_input" in st.session_state:
+    st.session_state.rotation_input = st.session_state.pop("restore_rotation_input")
 
 if restore_notice := st.session_state.pop("restore_notice", None):
     st.success(f"前回の入力を復元しました（最終保存：{restore_notice}）")
@@ -243,77 +255,85 @@ session_name = st.text_input(
     key="session_name",
 )
 
-start_rotation = st.number_input(
-    "開始回転数",
+rotation_input = st.number_input(
+    "現在回転数",
     min_value=0,
     step=1,
-    key="start_rotation",
+    key="rotation_input",
+    help="数字を入力し、「区間開始」または「1k確定」を押します。",
 )
 
-st.session_state.current_values = adjust_values(st.session_state.current_values, MAX_ROWS)
+action_col1, action_col2 = st.columns(2)
+with action_col1:
+    start_clicked = st.button(
+        "区間開始",
+        use_container_width=True,
+        help="当たり・ST終了後など、新しい回転数の始まりを記録します。投資kは増えません。",
+    )
+with action_col2:
+    confirm_clicked = st.button(
+        "1k確定",
+        use_container_width=True,
+        help="前回値から1k使用後の回転数を記録します。",
+    )
 
-display_mode = st.radio(
-    "表示範囲",
-    options=["最新付近を表示", "全体を表示"],
-    horizontal=True,
-    index=0,
-    help="入力中は「最新付近を表示」の方がスクロール戻りを避けやすいです。",
-)
-
-window_size = st.selectbox(
-    "表示行数",
-    options=[10, 20, 30, 40, 60],
-    index=2,
-    disabled=(display_mode == "全体を表示"),
-)
-
-display_table_all, latest, calc_detail = calculate_all(st.session_state.current_values, start_rotation)
-
-start_k, end_k = get_window_range(st.session_state.current_values, window_size, display_mode)
-display_table = display_table_all[
-    (display_table_all["投資k"] >= start_k) & (display_table_all["投資k"] <= end_k)
-].copy()
-
-st.markdown(f"### 入力・計算表（{start_k}k〜{end_k}k）")
-
-edited = st.data_editor(
-    display_table,
-    hide_index=True,
-    use_container_width=True,
-    height=560,
-    num_rows="fixed",
-    disabled=["投資k", "今回1k", "累計/k", "直近5k", "直近10k", "累計回転"],
-    column_config={
-        "投資k": st.column_config.NumberColumn("投資k", width="small"),
-        "現在回転数": st.column_config.NumberColumn("現在回転数", min_value=0, step=1, width="small"),
-        "今回1k": st.column_config.NumberColumn("今回1k", width="small"),
-        "累計/k": st.column_config.NumberColumn("累計/k", width="small", format="%.2f"),
-        "直近5k": st.column_config.NumberColumn("直近5k", width="small", format="%.2f"),
-        "直近10k": st.column_config.NumberColumn("直近10k", width="small", format="%.2f"),
-        "累計回転": st.column_config.NumberColumn("累計回転", width="small"),
-    },
-    key="kaiten_single_table",
-)
-
-new_visible_values = edited["現在回転数"].tolist()
-normalized_visible = []
-for v in new_visible_values:
-    if pd.isna(v):
-        normalized_visible.append(None)
-    else:
-        normalized_visible.append(int(v))
-
-new_all_values = st.session_state.current_values.copy()
-new_all_values[start_k - 1:end_k] = normalized_visible
-
-if new_all_values != st.session_state.current_values:
-    st.session_state.current_values = new_all_values
+if start_clicked:
+    st.session_state.events.append({"type": "start", "value": int(rotation_input)})
     st.rerun()
 
-display_table_all, latest, calc_detail = calculate_all(st.session_state.current_values, start_rotation)
+if confirm_clicked:
+    if not st.session_state.events:
+        st.error("先に「区間開始」で開始回転数を記録してください。")
+    else:
+        previous_value = int(st.session_state.events[-1]["value"])
+        if int(rotation_input) <= previous_value:
+            st.error(
+                f"1k確定できません。入力値 {int(rotation_input)} は前回値 "
+                f"{previous_value} 以下です。当たり・ST終了後なら「区間開始」を押してください。"
+            )
+        else:
+            st.session_state.events.append({"type": "1k", "value": int(rotation_input)})
+            st.rerun()
+
+delete_clicked = st.button(
+    "直前の1行を削除",
+    use_container_width=True,
+    disabled=not st.session_state.events,
+    help="最後に記録した区間開始または1k確定を削除します。",
+)
+
+if delete_clicked:
+    deleted = st.session_state.events.pop()
+    st.session_state.restore_rotation_input = int(deleted["value"])
+    st.session_state.delete_notice = (
+        f"直前の1行（{'区間開始' if deleted['type'] == 'start' else '1k確定'}："
+        f"{deleted['value']}）を削除しました。"
+    )
+    st.rerun()
+
+if delete_notice := st.session_state.pop("delete_notice", None):
+    st.success(delete_notice)
+
+display_table_all, latest, calc_detail = calculate_all(st.session_state.events)
+
+st.markdown("### 入力履歴")
+
+if display_table_all.empty:
+    st.caption("現在回転数を入力し、最初に「区間開始」を押してください。")
+else:
+    history_columns = [
+        "記録No", "区間", "区分", "投資k", "現在回転数", "今回1k",
+        "累計/k", "直近5k", "直近10k", "累計回転",
+    ]
+    st.dataframe(
+        display_table_all[history_columns].tail(30),
+        hide_index=True,
+        use_container_width=True,
+        height=480,
+    )
 
 if latest is None:
-    st.info("現在回転数を入力すると、同じ表の右側に計算結果が表示されます。")
+    st.info("区間開始を記録しました。1k使用後の現在回転数を入力し、「1k確定」を押してください。")
 else:
     st.markdown("### 現在の結果")
 
@@ -389,11 +409,10 @@ else:
         if st.button("この実戦を保存して次へ", disabled=not result_is_valid):
             detail_to_save = calc_detail.copy()
             detail_to_save.insert(0, "保存名", session_name)
-            detail_to_save.insert(1, "開始回転数", int(start_rotation))
-            detail_to_save.insert(2, "保存時刻", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            detail_to_save.insert(1, "保存時刻", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
             st.session_state.saved_sessions.append({
-                "summary": make_summary_record(session_name, start_rotation, latest, result_data),
+                "summary": make_summary_record(session_name, latest, result_data),
                 "detail": detail_to_save,
             })
             st.session_state.reset_current_session = True
@@ -477,4 +496,4 @@ if draft_json != st.session_state.get("last_saved_draft"):
     )
     st.session_state.last_saved_draft = draft_json
 
-st.caption("※ 入力途中の内容は、この端末のブラウザへ自動保存されます。Safariの履歴・Webサイトデータを消去すると復元できません。保存済みデータは必要に応じてCSVダウンロードしてください。")
+st.caption("※ 区間開始・1k確定の履歴は、この端末のブラウザへ自動保存されます。Safariの履歴・Webサイトデータを消去すると復元できません。保存済みデータは必要に応じてCSVダウンロードしてください。")
