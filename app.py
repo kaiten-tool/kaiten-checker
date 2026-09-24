@@ -31,6 +31,36 @@ h2, h3 {
 [data-testid="stMetricLabel"] {
     font-size: 0.72rem;
 }
+.kc-metrics {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 6px;
+    margin: 0.25rem 0 0.5rem;
+}
+.kc-metric {
+    border: 1px solid rgba(128, 128, 128, 0.35);
+    border-radius: 8px;
+    padding: 6px 8px;
+}
+.kc-label {
+    font-size: 0.72rem;
+    opacity: 0.75;
+}
+.kc-value {
+    font-size: 1.15rem;
+    font-weight: 600;
+    line-height: 1.3;
+}
+.kc-diff {
+    font-size: 0.78rem;
+    font-weight: 600;
+}
+.kc-plus {
+    color: #1a9c4a;
+}
+.kc-minus {
+    color: #d9363e;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -38,6 +68,9 @@ st.title("🎰 回転率チェッカー")
 st.caption("現在回転数を入力し、「区間開始」または「1k確定」を押して記録します。ほかの値は自動計算です。")
 
 MAX_EVENTS = 300
+# 今回1kがこの範囲外なら入力ミスの可能性があるため確認する。
+SUSPICIOUS_MIN_1K = 8
+SUSPICIOUS_MAX_1K = 45
 LOCAL_STORAGE_KEY = "kaiten_checker_draft_v1"
 SAVED_SESSIONS_STORAGE_KEY = "kaiten_checker_saved_sessions_v1"
 
@@ -138,10 +171,12 @@ def calculate_all(events):
     history = pd.DataFrame(rows)
     return history, latest, history.copy()
 
-def make_summary_record(session_name, latest, result_data):
+def make_summary_record(session_name, latest, result_data, border):
     return {
         "保存名": session_name,
         "保存時刻": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "ボーダー": round(border, 1) if border > 0 else None,
+        "ボーダー差（累計/k）": round(float(latest["累計/k"]) - border, 2) if border > 0 else None,
         "開始回転数": int(latest["開始回転数"]),
         "累計投資k": int(latest["累計投資k"]),
         "最終回転数": int(latest["現在回転数"]),
@@ -169,6 +204,7 @@ def make_draft_payload():
         "kakuhen_hits": int(st.session_state.get("kakuhen_hits", 0)),
         "total_hits": int(st.session_state.get("total_hits", 0)),
         "earned_balls": int(st.session_state.get("earned_balls", 0)),
+        "border": float(st.session_state.get("border", 0.0)),
     }
 
 def parse_draft(raw_draft):
@@ -196,6 +232,7 @@ def parse_draft(raw_draft):
             "kakuhen_hits": max(0, int(draft.get("kakuhen_hits", 0))),
             "total_hits": max(0, int(draft.get("total_hits", 0))),
             "earned_balls": max(0, int(draft.get("earned_balls", 0))),
+            "border": max(0.0, float(draft.get("border", 0.0))),
             "saved_at": str(draft.get("saved_at", "")),
         }
     except (TypeError, ValueError):
@@ -239,7 +276,8 @@ def parse_saved_sessions(raw_saved):
 def reset_current_session():
     st.session_state.events = []
     st.session_state.session_name = "実戦1"
-    st.session_state.rotation_input = 0
+    st.session_state.rotation_input = None
+    st.session_state.pop("pending_1k", None)
     st.session_state.first_hits = 0
     st.session_state.kakuhen_hits = 0
     st.session_state.total_hits = 0
@@ -259,7 +297,7 @@ if st.session_state.get("storage_ready") and "draft_restored" not in st.session_
     if restored_draft:
         for key in [
             "session_name", "events", "first_hits",
-            "kakuhen_hits", "total_hits", "earned_balls",
+            "kakuhen_hits", "total_hits", "earned_balls", "border",
         ]:
             st.session_state[key] = restored_draft[key]
         st.session_state.restore_notice = restored_draft.get("saved_at", "")
@@ -275,7 +313,10 @@ if "session_name" not in st.session_state:
     st.session_state.session_name = "実戦1"
 
 if "rotation_input" not in st.session_state:
-    st.session_state.rotation_input = 0
+    st.session_state.rotation_input = None
+
+if "border" not in st.session_state:
+    st.session_state.border = 0.0
 
 if "saved_sessions" not in st.session_state:
     st.session_state.saved_sessions = []
@@ -290,26 +331,73 @@ for key in ["first_hits", "kakuhen_hits", "total_hits", "earned_balls"]:
 if st.session_state.pop("reset_current_session", False):
     reset_current_session()
 
+if st.session_state.pop("clear_rotation_input", False):
+    st.session_state.rotation_input = None
+
 if "restore_rotation_input" in st.session_state:
     st.session_state.rotation_input = st.session_state.pop("restore_rotation_input")
 
 if restore_notice := st.session_state.pop("restore_notice", None):
     st.success(f"前回の入力を復元しました（最終保存：{restore_notice}）")
 
+def append_event(event_type, value):
+    """履歴へ1行追加し、次の数字をすぐ打てるよう入力欄を空にする。"""
+    st.session_state.events.append({"type": event_type, "value": int(value)})
+    st.session_state.pop("pending_1k", None)
+    st.session_state.clear_rotation_input = True
+    st.rerun()
+
+def render_current_metrics(latest, border):
+    """現在の結果をスマホでも縦に伸びない3列のカードで表示する。"""
+    def card(label, value, rate=None):
+        diff_html = ""
+        if border > 0 and rate is not None:
+            diff = float(rate) - border
+            diff_class = "kc-plus" if diff >= 0 else "kc-minus"
+            diff_html = f'<div class="kc-diff {diff_class}">{diff:+.2f}</div>'
+        return (
+            f'<div class="kc-metric"><div class="kc-label">{label}</div>'
+            f'<div class="kc-value">{value}</div>{diff_html}</div>'
+        )
+
+    cards = [
+        card("累計投資", f"{int(latest['累計投資k'])}k"),
+        card("今回1k", f"{int(latest['今回1k'])}"),
+        card("累計回転", f"{int(latest['累計回転'])}"),
+        card("累計/k", f"{latest['累計/k']:.2f}", latest["累計/k"]),
+        card("直近5k", f"{latest['直近5k']:.2f}", latest["直近5k"]),
+        card("直近10k", f"{latest['直近10k']:.2f}", latest["直近10k"]),
+    ]
+    st.markdown(f'<div class="kc-metrics">{"".join(cards)}</div>', unsafe_allow_html=True)
+    if border > 0:
+        st.caption(f"下段の数字はボーダー {border:.1f} との差です（緑：上回り、赤：下回り）。")
+
 st.markdown("### 現在の実戦")
 
-session_name = st.text_input(
-    "保存名",
-    help="例：6/18 エヴァ、A店リゼロなど",
-    key="session_name",
-)
+name_col, border_col = st.columns([3, 2])
+with name_col:
+    session_name = st.text_input(
+        "保存名",
+        help="例：6/18 エヴァ、A店リゼロなど",
+        key="session_name",
+    )
+with border_col:
+    border = st.number_input(
+        "ボーダー（回転/k）",
+        min_value=0.0,
+        step=0.1,
+        format="%.1f",
+        key="border",
+        help="台のボーダーを入れると、累計/k・直近5k・直近10kとの差を表示します。0のときは表示しません。",
+    )
 
 rotation_input = st.number_input(
     "現在回転数",
     min_value=0,
     step=1,
     key="rotation_input",
-    help="数字を入力し、「区間開始」または「1k確定」を押します。",
+    placeholder="回転数を入力",
+    help="数字を入力し、「区間開始」または「1k確定」を押します。記録後は入力欄が空になります。",
 )
 
 action_col1, action_col2 = st.columns(2)
@@ -322,27 +410,64 @@ with action_col1:
 with action_col2:
     confirm_clicked = st.button(
         "1k確定",
+        type="primary",
         use_container_width=True,
         help="前回値から1k使用後の回転数を記録します。",
     )
 
 if start_clicked:
-    st.session_state.events.append({"type": "start", "value": int(rotation_input)})
-    st.rerun()
+    if rotation_input is None:
+        st.error("現在回転数を入力してください。")
+    else:
+        append_event("start", rotation_input)
 
 if confirm_clicked:
-    if not st.session_state.events:
+    if rotation_input is None:
+        st.error("現在回転数を入力してください。")
+    elif not st.session_state.events:
         st.error("先に「区間開始」で開始回転数を記録してください。")
     else:
         previous_value = int(st.session_state.events[-1]["value"])
-        if int(rotation_input) <= previous_value:
+        this_1k = int(rotation_input) - previous_value
+        if this_1k <= 0:
             st.error(
                 f"1k確定できません。入力値 {int(rotation_input)} は前回値 "
                 f"{previous_value} 以下です。当たり・ST終了後なら「区間開始」を押してください。"
             )
+        elif SUSPICIOUS_MIN_1K <= this_1k <= SUSPICIOUS_MAX_1K:
+            append_event("1k", rotation_input)
         else:
-            st.session_state.events.append({"type": "1k", "value": int(rotation_input)})
+            st.session_state.pending_1k = int(rotation_input)
             st.rerun()
+
+pending_1k = st.session_state.get("pending_1k")
+if pending_1k is not None:
+    previous_value = int(st.session_state.events[-1]["value"]) if st.session_state.events else None
+    if previous_value is None or pending_1k <= previous_value:
+        st.session_state.pop("pending_1k", None)
+    else:
+        st.warning(
+            f"今回1kが {pending_1k - previous_value} 回転になります"
+            f"（前回 {previous_value} → 入力 {pending_1k}）。入力ミスではありませんか？"
+        )
+        pending_col1, pending_col2 = st.columns(2)
+        with pending_col1:
+            if st.button("このまま1k確定", type="primary", use_container_width=True):
+                append_event("1k", pending_1k)
+        with pending_col2:
+            if st.button("やめて入力し直す", use_container_width=True):
+                st.session_state.pop("pending_1k", None)
+                st.session_state.restore_rotation_input = pending_1k
+                st.rerun()
+
+display_table_all, latest, calc_detail = calculate_all(st.session_state.events)
+
+if latest is not None:
+    render_current_metrics(latest, float(border))
+elif st.session_state.events:
+    st.info("区間開始を記録しました。1k使用後の現在回転数を入力し、「1k確定」を押してください。")
+else:
+    st.caption("現在回転数を入力し、最初に「区間開始」を押してください。")
 
 delete_clicked = st.button(
     "直前の1行を削除",
@@ -353,6 +478,7 @@ delete_clicked = st.button(
 
 if delete_clicked:
     deleted = st.session_state.events.pop()
+    st.session_state.pop("pending_1k", None)
     st.session_state.restore_rotation_input = int(deleted["value"])
     st.session_state.delete_notice = (
         f"直前の1行（{'区間開始' if deleted['type'] == 'start' else '1k確定'}："
@@ -363,38 +489,20 @@ if delete_clicked:
 if delete_notice := st.session_state.pop("delete_notice", None):
     st.success(delete_notice)
 
-display_table_all, latest, calc_detail = calculate_all(st.session_state.events)
-
-st.markdown("### 入力履歴")
-
-if display_table_all.empty:
-    st.caption("現在回転数を入力し、最初に「区間開始」を押してください。")
-else:
+if not display_table_all.empty:
+    st.markdown("### 入力履歴（新しい順）")
     history_columns = [
         "記録No", "区間", "区分", "投資k", "現在回転数", "今回1k",
         "累計/k", "直近5k", "直近10k", "累計回転",
     ]
     st.dataframe(
-        display_table_all[history_columns].tail(30),
+        display_table_all[history_columns].tail(30).iloc[::-1],
         hide_index=True,
         use_container_width=True,
-        height=480,
+        height=280,
     )
 
-if latest is None:
-    st.info("区間開始を記録しました。1k使用後の現在回転数を入力し、「1k確定」を押してください。")
-else:
-    st.markdown("### 現在の結果")
-
-    col0, col1, col2, col3, col4, col5, col6 = st.columns(7)
-    col0.metric("現在の結果", "最新")
-    col1.metric("累計投資", f"{int(latest['累計投資k'])}k")
-    col2.metric("今回1k", f"{int(latest['今回1k'])}")
-    col3.metric("累計/k", f"{latest['累計/k']:.2f}")
-    col4.metric("直近5k", f"{latest['直近5k']:.2f}")
-    col5.metric("直近10k", f"{latest['直近10k']:.2f}")
-    col6.metric("累計回転", f"{int(latest['累計回転'])}")
-
+if latest is not None:
     st.markdown("### 実戦結果")
 
     result_col1, result_col2 = st.columns(2)
@@ -461,7 +569,7 @@ else:
             detail_to_save.insert(1, "保存時刻", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
             st.session_state.saved_sessions.append({
-                "summary": make_summary_record(session_name, latest, result_data),
+                "summary": make_summary_record(session_name, latest, result_data, float(border)),
                 "detail": detail_to_save,
             })
             st.session_state.reset_current_session = True
@@ -532,8 +640,23 @@ else:
         mime="text/csv",
     )
 
-    if st.button("保存済みデータを全削除"):
-        st.session_state.saved_sessions = []
+    if st.session_state.get("confirm_delete_all"):
+        st.warning(
+            f"保存済みデータ（{len(st.session_state.saved_sessions)}件）をすべて削除します。"
+            "元に戻せません。必要ならCSVをダウンロードしてから削除してください。"
+        )
+        confirm_col1, confirm_col2 = st.columns(2)
+        with confirm_col1:
+            if st.button("削除する", type="primary", use_container_width=True):
+                st.session_state.saved_sessions = []
+                st.session_state.pop("confirm_delete_all", None)
+                st.rerun()
+        with confirm_col2:
+            if st.button("キャンセル", use_container_width=True):
+                st.session_state.pop("confirm_delete_all", None)
+                st.rerun()
+    elif st.button("保存済みデータを全削除"):
+        st.session_state.confirm_delete_all = True
         st.rerun()
 
 draft_json = json.dumps(make_draft_payload(), ensure_ascii=False)
