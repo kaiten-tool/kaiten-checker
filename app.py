@@ -283,6 +283,9 @@ if "saved_sessions" not in st.session_state:
 for key in ["first_hits", "kakuhen_hits", "total_hits", "earned_balls"]:
     if key not in st.session_state:
         st.session_state[key] = 0
+    # 実戦結果の入力欄は1k確定が無いと表示されず、Streamlitが値を破棄するため、
+    # 毎回代入し直して非表示の間も値を保持する。
+    st.session_state[key] = st.session_state[key]
 
 if st.session_state.pop("reset_current_session", False):
     reset_current_session()
