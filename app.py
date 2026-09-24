@@ -446,52 +446,64 @@ def render_cutoff_judgment(per_k_values, border):
     )
 
 def render_border_diff_chart(per_k_values, border):
-    """各時点の「直近5k平均−ボーダー」を±5回転の固定幅で表示する。"""
+    """各時点の直近5k・直近10k・累計の「平均−ボーダー」を±5回転の固定幅で表示する。"""
+    series = [("直近5k", 5), ("直近10k", 10), ("累計", None)]
     rows = []
     for investment_k in range(1, len(per_k_values) + 1):
-        recent = per_k_values[max(0, investment_k - 5):investment_k]
-        diff = round(sum(recent) / len(recent) - border, 2)
-        plotted = max(-CHART_DIFF_RANGE, min(CHART_DIFF_RANGE, diff))
-        rows.append({
-            "投資k": investment_k,
-            "ボーダー差": diff,
-            "表示位置": plotted,
-            "範囲": "上限超え" if diff > CHART_DIFF_RANGE else "下限超え" if diff < -CHART_DIFF_RANGE else "範囲内",
-        })
+        for name, window in series:
+            start_index = 0 if window is None else max(0, investment_k - window)
+            recent = per_k_values[start_index:investment_k]
+            diff = round(sum(recent) / len(recent) - border, 2)
+            rows.append({
+                "投資k": investment_k,
+                "指標": name,
+                "ボーダー差": diff,
+                "表示位置": max(-CHART_DIFF_RANGE, min(CHART_DIFF_RANGE, diff)),
+                "範囲外": "上限超え" if diff > CHART_DIFF_RANGE else "下限超え" if diff < -CHART_DIFF_RANGE else None,
+            })
     chart_df = pd.DataFrame(rows)
 
-    y_scale = alt.Scale(domain=[-CHART_DIFF_RANGE, CHART_DIFF_RANGE], clamp=True)
+    series_names = [name for name, _ in series]
+    color = alt.Color(
+        "指標:N",
+        title=None,
+        scale=alt.Scale(domain=series_names, range=["#1f77b4", "#f08000", "#7b3fa0"]),
+        sort=series_names,
+        legend=alt.Legend(orient="top", direction="horizontal"),
+    )
     base = alt.Chart(chart_df).encode(
         x=alt.X("投資k:Q", title="投資k", axis=alt.Axis(tickMinStep=1)),
-        y=alt.Y("表示位置:Q", title="直近5k − ボーダー（回転）", scale=y_scale),
-        tooltip=["投資k", alt.Tooltip("ボーダー差:Q", title="直近5k − ボーダー", format="+.2f")],
+        y=alt.Y(
+            "表示位置:Q",
+            title="平均 − ボーダー（回転）",
+            scale=alt.Scale(domain=[-CHART_DIFF_RANGE, CHART_DIFF_RANGE], clamp=True),
+        ),
+        color=color,
+        tooltip=["投資k", "指標", alt.Tooltip("ボーダー差:Q", title="平均 − ボーダー", format="+.2f")],
     )
-    line = base.mark_line()
-    points = base.mark_point(filled=True, size=45).encode(
+    lines = base.mark_line(strokeWidth=2)
+    out_of_range = base.transform_filter("datum['範囲外'] != null").mark_point(filled=True, size=50).encode(
         shape=alt.Shape(
-            "範囲:N",
-            scale=alt.Scale(
-                domain=["範囲内", "上限超え", "下限超え"],
-                range=["circle", "triangle-up", "triangle-down"],
-            ),
+            "範囲外:N",
+            scale=alt.Scale(domain=["上限超え", "下限超え"], range=["triangle-up", "triangle-down"]),
             legend=None,
         ),
     )
-    reference = alt.Chart(pd.DataFrame({
-        "y": [0, -CUTOFF_DIFF],
-        "線": ["ボーダー", "見切りライン"],
-    })).mark_rule(strokeDash=[4, 4]).encode(
+    reference = alt.Chart(pd.DataFrame({"y": [0, -CUTOFF_DIFF], "線": ["ボーダー", "見切りライン"]})).mark_rule(
+        strokeDash=[4, 4],
+    ).encode(
         y="y:Q",
-        color=alt.Color(
+        stroke=alt.Stroke(
             "線:N",
             scale=alt.Scale(domain=["ボーダー", "見切りライン"], range=["#888888", "#d9363e"]),
             legend=None,
         ),
     )
-    st.altair_chart((reference + line + points).properties(height=200), use_container_width=True)
+    st.altair_chart((reference + lines + out_of_range).properties(height=220), use_container_width=True)
     st.caption(
-        f"各時点の直近5k平均とボーダーの差です。灰色の点線＝ボーダー、赤の点線＝見切りライン（−{CUTOFF_DIFF:.0f}）。"
-        f"±{CHART_DIFF_RANGE:.0f}を超えた点は▲▼で上端・下端に表示します（タップで実際の値）。5k未満の時点はそれまでの平均です。"
+        f"各時点の平均とボーダーの差です。灰色の点線＝ボーダー、赤の点線＝見切りライン（−{CUTOFF_DIFF:.0f}）。"
+        f"累計と直近10kの線が離れてきたら、前半と今とで回転率が変わったサインです。"
+        f"±{CHART_DIFF_RANGE:.0f}を超えた点は▲▼で上端・下端に表示します（タップで実際の値）。"
     )
 
 st.markdown("### 現在の実戦")
