@@ -39,6 +39,7 @@ st.caption("現在回転数を入力し、「区間開始」または「1k確定
 
 MAX_EVENTS = 300
 LOCAL_STORAGE_KEY = "kaiten_checker_draft_v1"
+SAVED_SESSIONS_STORAGE_KEY = "kaiten_checker_saved_sessions_v1"
 
 def normalize_events(events):
     """保存値を安全なイベント列へ整形する。"""
@@ -200,6 +201,41 @@ def parse_draft(raw_draft):
     except (TypeError, ValueError):
         return None
 
+def serialize_saved_sessions(saved_sessions):
+    """保存済み実戦をlocalStorageへ保存できるJSON文字列にする。"""
+    serialized = []
+    for saved in saved_sessions:
+        detail = saved["detail"].astype(object)
+        detail = detail.where(detail.notna(), None)
+        serialized.append({
+            "summary": saved["summary"],
+            "detail": detail.to_dict(orient="records"),
+        })
+    return json.dumps(serialized, ensure_ascii=False)
+
+def parse_saved_sessions(raw_saved):
+    """localStorageの保存済み実戦を検証し、画面表示用の形へ戻す。"""
+    if not raw_saved:
+        return []
+
+    try:
+        saved_list = json.loads(raw_saved) if isinstance(raw_saved, str) else raw_saved
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(saved_list, list):
+        return []
+
+    restored = []
+    for saved in saved_list:
+        if not isinstance(saved, dict):
+            continue
+        summary = saved.get("summary")
+        detail = saved.get("detail")
+        if not isinstance(summary, dict) or not isinstance(detail, list):
+            continue
+        restored.append({"summary": summary, "detail": pd.DataFrame(detail)})
+    return restored
+
 def reset_current_session():
     st.session_state.events = []
     st.session_state.session_name = "実戦1"
@@ -227,6 +263,9 @@ if st.session_state.get("storage_ready") and "draft_restored" not in st.session_
         ]:
             st.session_state[key] = restored_draft[key]
         st.session_state.restore_notice = restored_draft.get("saved_at", "")
+    st.session_state.saved_sessions = parse_saved_sessions(
+        local_storage.getItem(SAVED_SESSIONS_STORAGE_KEY)
+    )
     st.session_state.draft_restored = True
 
 if "events" not in st.session_state:
@@ -503,4 +542,13 @@ if st.session_state.get("draft_restored") and draft_json != st.session_state.get
     )
     st.session_state.last_saved_draft = draft_json
 
-st.caption("※ 区間開始・1k確定の履歴は、この端末のブラウザへ自動保存されます。Safariの履歴・Webサイトデータを消去すると復元できません。保存済みデータは必要に応じてCSVダウンロードしてください。")
+saved_sessions_json = serialize_saved_sessions(st.session_state.saved_sessions)
+if st.session_state.get("draft_restored") and saved_sessions_json != st.session_state.get("last_saved_sessions"):
+    local_storage.setItem(
+        SAVED_SESSIONS_STORAGE_KEY,
+        saved_sessions_json,
+        key="kaiten_checker_saved_sessions_autosave",
+    )
+    st.session_state.last_saved_sessions = saved_sessions_json
+
+st.caption("※ 入力途中の履歴と保存済みデータは、この端末のブラウザへ自動保存されます。Safariの履歴・Webサイトデータを消去すると復元できないため、大事なデータはCSVダウンロードしてください。")
