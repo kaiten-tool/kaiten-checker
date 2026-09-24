@@ -35,7 +35,7 @@ h2, h3 {
 """, unsafe_allow_html=True)
 
 st.title("🎰 回転率チェッカー")
-st.caption("開始回転数を入れ、表の「現在回転数」だけ入力します。ほかの列は自動計算です。")
+st.caption("現在回転数を入力し、「区間開始」または「1k確定」を押して記録します。ほかの値は自動計算です。")
 
 MAX_EVENTS = 300
 LOCAL_STORAGE_KEY = "kaiten_checker_draft_v1"
@@ -209,9 +209,16 @@ def reset_current_session():
     st.session_state.total_hits = 0
     st.session_state.earned_balls = 0
 
-local_storage = LocalStorage(key="kaiten_checker_local_storage")
+LOCAL_STORAGE_COMPONENT_KEY = "kaiten_checker_local_storage"
 
-if "draft_restored" not in st.session_state:
+# 初回実行ではブラウザからlocalStorageの値がまだ届かず空の値が返るため、
+# 値が届いた後の再実行まで復元と自動保存を待つ（空データで上書きしないため）。
+if LOCAL_STORAGE_COMPONENT_KEY in st.session_state:
+    st.session_state.storage_ready = True
+
+local_storage = LocalStorage(key=LOCAL_STORAGE_COMPONENT_KEY)
+
+if st.session_state.get("storage_ready") and "draft_restored" not in st.session_state:
     restored_draft = parse_draft(local_storage.getItem(LOCAL_STORAGE_KEY))
     if restored_draft:
         for key in [
@@ -488,7 +495,7 @@ else:
         st.rerun()
 
 draft_json = json.dumps(make_draft_payload(), ensure_ascii=False)
-if draft_json != st.session_state.get("last_saved_draft"):
+if st.session_state.get("draft_restored") and draft_json != st.session_state.get("last_saved_draft"):
     local_storage.setItem(
         LOCAL_STORAGE_KEY,
         draft_json,
