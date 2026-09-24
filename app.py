@@ -107,6 +107,8 @@ SUSPICIOUS_MIN_1K = 8
 SUSPICIOUS_MAX_1K = 45
 # 直近の回転率がボーダーをこの値以上下回ったら見切りの目安を出す。
 CUTOFF_DIFF = 2.0
+# ボーダー差グラフの縦軸の幅（±回転）。超えた点は上端・下端に表示する。
+CHART_DIFF_RANGE = 5.0
 LOCAL_STORAGE_KEY = "kaiten_checker_draft_v1"
 SAVED_SESSIONS_STORAGE_KEY = "kaiten_checker_saved_sessions_v1"
 
@@ -444,22 +446,53 @@ def render_cutoff_judgment(per_k_values, border):
     )
 
 def render_border_diff_chart(per_k_values, border):
-    """1kごとの「今回1k−ボーダー」を積み上げ、回転率が変わった位置を見えるようにする。"""
-    running = 0.0
-    rows = [{"投資k": 0, "ボーダー差の累積": 0.0}]
-    for investment_k, this_1k in enumerate(per_k_values, start=1):
-        running += this_1k - border
-        rows.append({"投資k": investment_k, "ボーダー差の累積": round(running, 2)})
+    """各時点の「直近5k平均−ボーダー」を±5回転の固定幅で表示する。"""
+    rows = []
+    for investment_k in range(1, len(per_k_values) + 1):
+        recent = per_k_values[max(0, investment_k - 5):investment_k]
+        diff = round(sum(recent) / len(recent) - border, 2)
+        plotted = max(-CHART_DIFF_RANGE, min(CHART_DIFF_RANGE, diff))
+        rows.append({
+            "投資k": investment_k,
+            "ボーダー差": diff,
+            "表示位置": plotted,
+            "範囲": "上限超え" if diff > CHART_DIFF_RANGE else "下限超え" if diff < -CHART_DIFF_RANGE else "範囲内",
+        })
     chart_df = pd.DataFrame(rows)
 
-    line = alt.Chart(chart_df).mark_line(point=True).encode(
+    y_scale = alt.Scale(domain=[-CHART_DIFF_RANGE, CHART_DIFF_RANGE], clamp=True)
+    base = alt.Chart(chart_df).encode(
         x=alt.X("投資k:Q", title="投資k", axis=alt.Axis(tickMinStep=1)),
-        y=alt.Y("ボーダー差の累積:Q", title="ボーダー差の累積（回転）"),
-        tooltip=["投資k", alt.Tooltip("ボーダー差の累積:Q", format="+.2f")],
+        y=alt.Y("表示位置:Q", title="直近5k − ボーダー（回転）", scale=y_scale),
+        tooltip=["投資k", alt.Tooltip("ボーダー差:Q", title="直近5k − ボーダー", format="+.2f")],
     )
-    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(strokeDash=[4, 4], opacity=0.6).encode(y="y:Q")
-    st.altair_chart((zero + line).properties(height=200), use_container_width=True)
-    st.caption("右上がり＝ボーダー超え、平ら＝ボーダー並み、途中で右下がりに折れた所＝回転率が落ちた所です。")
+    line = base.mark_line()
+    points = base.mark_point(filled=True, size=45).encode(
+        shape=alt.Shape(
+            "範囲:N",
+            scale=alt.Scale(
+                domain=["範囲内", "上限超え", "下限超え"],
+                range=["circle", "triangle-up", "triangle-down"],
+            ),
+            legend=None,
+        ),
+    )
+    reference = alt.Chart(pd.DataFrame({
+        "y": [0, -CUTOFF_DIFF],
+        "線": ["ボーダー", "見切りライン"],
+    })).mark_rule(strokeDash=[4, 4]).encode(
+        y="y:Q",
+        color=alt.Color(
+            "線:N",
+            scale=alt.Scale(domain=["ボーダー", "見切りライン"], range=["#888888", "#d9363e"]),
+            legend=None,
+        ),
+    )
+    st.altair_chart((reference + line + points).properties(height=200), use_container_width=True)
+    st.caption(
+        f"各時点の直近5k平均とボーダーの差です。灰色の点線＝ボーダー、赤の点線＝見切りライン（−{CUTOFF_DIFF:.0f}）。"
+        f"±{CHART_DIFF_RANGE:.0f}を超えた点は▲▼で上端・下端に表示します（タップで実際の値）。5k未満の時点はそれまでの平均です。"
+    )
 
 st.markdown("### 現在の実戦")
 
