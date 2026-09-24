@@ -61,6 +61,40 @@ h2, h3 {
 .kc-minus {
     color: #d9363e;
 }
+.kc-judge {
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin: 0.25rem 0 0.5rem;
+    border-left: 6px solid;
+}
+.kc-judge-title {
+    font-weight: 700;
+    font-size: 1rem;
+}
+.kc-judge-detail {
+    font-size: 0.8rem;
+    opacity: 0.85;
+}
+.kc-judge-stop {
+    background: rgba(217, 54, 62, 0.14);
+    border-color: #d9363e;
+}
+.kc-judge-consider {
+    background: rgba(240, 128, 0, 0.14);
+    border-color: #f08000;
+}
+.kc-judge-caution {
+    background: rgba(230, 180, 0, 0.16);
+    border-color: #e6b400;
+}
+.kc-judge-good {
+    background: rgba(26, 156, 74, 0.12);
+    border-color: #1a9c4a;
+}
+.kc-judge-neutral {
+    background: rgba(128, 128, 128, 0.12);
+    border-color: rgba(128, 128, 128, 0.6);
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -71,6 +105,8 @@ MAX_EVENTS = 300
 # 今回1kがこの範囲外なら入力ミスの可能性があるため確認する。
 SUSPICIOUS_MIN_1K = 8
 SUSPICIOUS_MAX_1K = 45
+# 直近の回転率がボーダーをこの値以上下回ったら見切りの目安を出す。
+CUTOFF_DIFF = 2.0
 LOCAL_STORAGE_KEY = "kaiten_checker_draft_v1"
 SAVED_SESSIONS_STORAGE_KEY = "kaiten_checker_saved_sessions_v1"
 
@@ -372,6 +408,59 @@ def render_current_metrics(latest, border):
     if border > 0:
         st.caption(f"下段の数字はボーダー {border:.1f} との差です（緑：上回り、赤：下回り）。")
 
+def judge_cutoff(per_k_values, border):
+    """直近5k・10kとボーダーの差から見切りの目安を返す。"""
+    count = len(per_k_values)
+    if count < 5:
+        return "neutral", "判定待ち", f"見切りの目安は5k以上で表示します（現在{count}k）。"
+
+    def average(values):
+        return sum(values) / len(values)
+
+    recent5_diff = average(per_k_values[-5:]) - border
+    detail = f"直近5k {recent5_diff:+.2f}"
+    recent10_diff = None
+    if count >= 10:
+        recent10_diff = average(per_k_values[-10:]) - border
+        previous5_diff = average(per_k_values[-10:-5]) - border
+        detail += f"、直近10k {recent10_diff:+.2f}"
+        if recent5_diff <= -CUTOFF_DIFF and previous5_diff <= -CUTOFF_DIFF:
+            return "stop", "見切り", f"5kごとに2回続けてボーダー−{CUTOFF_DIFF:.0f}以下です（{detail}）。"
+        if recent10_diff <= -CUTOFF_DIFF:
+            return "consider", "見切り検討", f"直近10kがボーダー−{CUTOFF_DIFF:.0f}以下です。前半が良くてもやめる候補です（{detail}）。"
+
+    if recent5_diff <= -CUTOFF_DIFF:
+        return "caution", "注意", f"直近5kがボーダー−{CUTOFF_DIFF:.0f}以下です。打ち方と記録タイミングを確認し、次の5kで確かめてください（{detail}）。"
+    if recent5_diff >= 0 and (recent10_diff is None or recent10_diff >= 0):
+        return "good", "良好", f"直近はボーダー以上です（{detail}）。"
+    return "neutral", "様子見", f"大きな下振れはありません（{detail}）。"
+
+def render_cutoff_judgment(per_k_values, border):
+    level, title, detail = judge_cutoff(per_k_values, border)
+    st.markdown(
+        f'<div class="kc-judge kc-judge-{level}"><div class="kc-judge-title">{title}</div>'
+        f'<div class="kc-judge-detail">{detail}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+def render_border_diff_chart(per_k_values, border):
+    """1kごとの「今回1k−ボーダー」を積み上げ、回転率が変わった位置を見えるようにする。"""
+    running = 0.0
+    rows = [{"投資k": 0, "ボーダー差の累積": 0.0}]
+    for investment_k, this_1k in enumerate(per_k_values, start=1):
+        running += this_1k - border
+        rows.append({"投資k": investment_k, "ボーダー差の累積": round(running, 2)})
+    chart_df = pd.DataFrame(rows)
+
+    line = alt.Chart(chart_df).mark_line(point=True).encode(
+        x=alt.X("投資k:Q", title="投資k", axis=alt.Axis(tickMinStep=1)),
+        y=alt.Y("ボーダー差の累積:Q", title="ボーダー差の累積（回転）"),
+        tooltip=["投資k", alt.Tooltip("ボーダー差の累積:Q", format="+.2f")],
+    )
+    zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(strokeDash=[4, 4], opacity=0.6).encode(y="y:Q")
+    st.altair_chart((zero + line).properties(height=200), use_container_width=True)
+    st.caption("右上がり＝ボーダー超え、平ら＝ボーダー並み、途中で右下がりに折れた所＝回転率が落ちた所です。")
+
 st.markdown("### 現在の実戦")
 
 name_col, border_col = st.columns([3, 2])
@@ -464,6 +553,14 @@ display_table_all, latest, calc_detail = calculate_all(st.session_state.events)
 
 if latest is not None:
     render_current_metrics(latest, float(border))
+    per_k_values = [
+        int(value) for value in display_table_all.loc[display_table_all["区分"] == "1k確定", "今回1k"]
+    ]
+    if float(border) > 0:
+        render_cutoff_judgment(per_k_values, float(border))
+        render_border_diff_chart(per_k_values, float(border))
+    else:
+        st.caption("ボーダーを入力すると、見切りの目安とボーダー差の累積グラフを表示します。")
 elif st.session_state.events:
     st.info("区間開始を記録しました。1k使用後の現在回転数を入力し、「1k確定」を押してください。")
 else:
