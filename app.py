@@ -2,6 +2,7 @@
 import streamlit as st
 import pandas as pd
 import altair as alt
+import html
 import json
 from datetime import datetime
 from streamlit_local_storage import LocalStorage
@@ -61,6 +62,24 @@ h2, h3 {
 .kc-minus {
     color: #d9363e;
 }
+.kc-saved {
+    border: 1px solid rgba(128, 128, 128, 0.35);
+    border-radius: 8px;
+    padding: 8px;
+    margin: 0 0 0.5rem;
+}
+.kc-saved-title {
+    font-weight: 700;
+    font-size: 0.95rem;
+}
+.kc-saved-time {
+    font-size: 0.72rem;
+    opacity: 0.75;
+    margin-bottom: 4px;
+}
+.kc-saved .kc-metrics {
+    margin: 0 0 4px;
+}
 .kc-judge {
     border-radius: 8px;
     padding: 8px 10px;
@@ -111,6 +130,13 @@ CUTOFF_DIFF = 2.0
 CHART_DIFF_RANGE = 5.0
 LOCAL_STORAGE_KEY = "kaiten_checker_draft_v1"
 SAVED_SESSIONS_STORAGE_KEY = "kaiten_checker_saved_sessions_v1"
+# 保存済みサマリーの列順。スマホで横スクロールせずに当たり・玉数が見えるよう前に置く。
+SUMMARY_COLUMNS = [
+    "保存名", "初当たり回数", "総当たり回数", "確変突入回数", "単発回数",
+    "使用玉数", "獲得玉数", "差玉",
+    "累計投資k", "累計/k", "ボーダー", "ボーダー差（累計/k）", "直近5k", "直近10k",
+    "開始回転数", "最終回転数", "累計回転", "保存時刻",
+]
 
 def normalize_events(events):
     """保存値を安全なイベント列へ整形する。"""
@@ -230,6 +256,60 @@ def make_summary_record(session_name, latest, result_data, border):
         "獲得玉数": result_data["獲得玉数"],
         "差玉": result_data["差玉"],
     }
+
+def order_summary_columns(summary_df):
+    """サマリーを決まった列順に並べる。旧データに無い列は飛ばし、未知の列は末尾に残す。"""
+    known = [column for column in SUMMARY_COLUMNS if column in summary_df.columns]
+    others = [column for column in summary_df.columns if column not in SUMMARY_COLUMNS]
+    return summary_df[known + others]
+
+def render_saved_session_cards(summaries):
+    """保存済み実戦を新しい順に、当たり・玉数が一目で分かるカードで表示する。"""
+    def number(value):
+        try:
+            number_value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return None if number_value != number_value else number_value
+
+    def card(label, value, value_class=""):
+        return (
+            f'<div class="kc-metric"><div class="kc-label">{label}</div>'
+            f'<div class="kc-value {value_class}">{value}</div></div>'
+        )
+
+    def count(summary, key, unit):
+        value = number(summary.get(key))
+        return "−" if value is None else f"{int(value):,}{unit}"
+
+    for summary in reversed(summaries):
+        difference = number(summary.get("差玉"))
+        difference_class = "" if difference is None else ("kc-plus" if difference >= 0 else "kc-minus")
+        rate = number(summary.get("累計/k"))
+        border_diff = number(summary.get("ボーダー差（累計/k）"))
+        rate_class = "" if border_diff is None else ("kc-plus" if border_diff >= 0 else "kc-minus")
+        rate_text = "−" if rate is None else f"{rate:.2f}"
+        if border_diff is not None:
+            rate_text += f'<span class="kc-diff"> ({border_diff:+.2f})</span>'
+
+        cards = [
+            card("初当たり", count(summary, "初当たり回数", "回")),
+            card("総当たり", count(summary, "総当たり回数", "回")),
+            card("確変／単発", f'{count(summary, "確変突入回数", "")}／{count(summary, "単発回数", "")}'),
+            card("使用玉数", count(summary, "使用玉数", "玉")),
+            card("獲得玉数", count(summary, "獲得玉数", "玉")),
+            card("差玉", "−" if difference is None else f"{int(difference):+,}玉", difference_class),
+            card("投資", count(summary, "累計投資k", "k")),
+            card("累計/k", rate_text, rate_class),
+            card("ボーダー", "−" if number(summary.get("ボーダー")) is None else f'{number(summary.get("ボーダー")):.1f}'),
+        ]
+        st.markdown(
+            f'<div class="kc-saved">'
+            f'<div class="kc-saved-title">{html.escape(str(summary.get("保存名", "")))}</div>'
+            f'<div class="kc-saved-time">{html.escape(str(summary.get("保存時刻", "")))}</div>'
+            f'<div class="kc-metrics">{"".join(cards)}</div></div>',
+            unsafe_allow_html=True,
+        )
 
 def make_draft_payload():
     """入力途中の実戦をブラウザへ保存できる形にまとめる。"""
@@ -758,7 +838,11 @@ st.markdown("### 保存済みデータ")
 if not st.session_state.saved_sessions:
     st.caption("まだ保存済みデータはありません。")
 else:
-    summary_df = pd.DataFrame([s["summary"] for s in st.session_state.saved_sessions])
+    summaries = [s["summary"] for s in st.session_state.saved_sessions]
+    st.caption("新しい順に表示しています。累計/kの（　）内はボーダー差です（緑：プラス、赤：マイナス）。")
+    render_saved_session_cards(summaries)
+
+    summary_df = order_summary_columns(pd.DataFrame(summaries))
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
     all_detail_df = pd.concat([s["detail"] for s in st.session_state.saved_sessions], ignore_index=True)
