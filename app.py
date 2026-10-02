@@ -104,6 +104,9 @@ h2, h3, h4 {
     min-height: 3.2rem;
     border-radius: 14px;
 }
+.st-key-reset_session_button {
+    margin-top: 2rem;
+}
 .st-key-save_session_button button p {
     font-size: 1.1rem;
     font-weight: 700;
@@ -892,7 +895,7 @@ if latest is not None:
         st.session_state.reset_current_session = True
         st.rerun()
 
-    if st.button("保存せず入力をリセット"):
+    if st.button("保存せず入力をリセット", key="reset_session_button"):
         st.session_state.reset_current_session = True
         st.rerun()
 
