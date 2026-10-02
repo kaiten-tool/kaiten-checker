@@ -4,8 +4,10 @@ import pandas as pd
 import altair as alt
 import html
 import json
+import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import requests
 from streamlit_local_storage import LocalStorage
 
 st.set_page_config(
@@ -80,6 +82,11 @@ h2, h3, h4 {
 }
 .kc-saved .kc-metrics {
     margin: 0 0 4px;
+}
+.kc-sent {
+    font-size: 0.72rem;
+    font-weight: 600;
+    margin-left: 6px;
 }
 .kc-result {
     margin: 0.25rem 0 0.5rem;
@@ -278,6 +285,7 @@ def calculate_all(events):
                 "直近5k": round(sum(per_k_values[-5:]) / len(per_k_values[-5:]), 2) if per_k_values else None,
                 "直近10k": round(sum(per_k_values[-10:]) / len(per_k_values[-10:]), 2) if per_k_values else None,
                 "累計回転": total_rotation,
+                "時刻": event.get("at"),
             })
             continue
 
@@ -301,6 +309,7 @@ def calculate_all(events):
             "累計回転": total_rotation,
             "開始回転数": first_start,
             "累計投資k": investment_k,
+            "時刻": event.get("at"),
         }
         rows.append(row)
         latest = pd.Series(row)
@@ -378,12 +387,19 @@ def render_result_list(summary):
     )
     return f'<div class="kc-result">{rows_html}</div>'
 
-def render_saved_session_cards(summaries):
+def render_saved_session_cards(saved_sessions, show_sent):
     """保存済み実戦を新しい順に、転記用の結果一覧で表示する。"""
-    for summary in reversed(summaries):
+    for saved in reversed(saved_sessions):
+        summary = saved["summary"]
+        badge = ""
+        if show_sent:
+            badge = (
+                '<span class="kc-sent kc-plus">送信済み</span>' if saved["sent"]
+                else '<span class="kc-sent kc-minus">未送信</span>'
+            )
         st.markdown(
             f'<div class="kc-saved">'
-            f'<div class="kc-saved-title">{html.escape(str(summary.get("保存名", "")))}</div>'
+            f'<div class="kc-saved-title">{html.escape(str(summary.get("保存名", "")))}{badge}</div>'
             f'<div class="kc-saved-time">保存：{html.escape(str(summary.get("保存時刻", "")))}</div>'
             f'{render_result_list(summary)}</div>',
             unsafe_allow_html=True,
@@ -441,6 +457,8 @@ def serialize_saved_sessions(saved_sessions):
         detail = saved["detail"].astype(object)
         detail = detail.where(detail.notna(), None)
         serialized.append({
+            "id": saved["id"],
+            "sent": saved["sent"],
             "summary": saved["summary"],
             "detail": detail.to_dict(orient="records"),
         })
@@ -466,8 +484,101 @@ def parse_saved_sessions(raw_saved):
         detail = saved.get("detail")
         if not isinstance(summary, dict) or not isinstance(detail, list):
             continue
-        restored.append({"summary": summary, "detail": pd.DataFrame(detail)})
+        restored.append({
+            # IDと送信済みの印は送信機能より前の保存データには無いため、ここで補う（未送信扱い）。
+            "id": str(saved.get("id") or new_session_id(summary.get("保存時刻"))),
+            "sent": bool(saved.get("sent", False)),
+            "summary": summary,
+            "detail": pd.DataFrame(detail),
+        })
     return restored
+
+def new_session_id(saved_at=None):
+    """実戦を見分けるID。シート側で同じ実戦の二重書き込みを防ぐのにも使う。"""
+    stamp = "".join(ch for ch in str(saved_at or now_text()) if ch.isdigit())
+    return f"{stamp[:8]}-{stamp[8:14]}-{uuid.uuid4().hex[:6]}"
+
+def sheet_settings():
+    """Streamlitのsecretsからスプレッドシートの受付窓口のURLと合言葉を読む。未設定ならNone。"""
+    try:
+        sheet = st.secrets.get("sheet", {})
+        url, token = sheet.get("url"), sheet.get("token")
+    except Exception:
+        return None
+    return (url, token) if url and token else None
+
+def blank_if_missing(value):
+    if value is None:
+        return ""
+    if isinstance(value, float) and value != value:
+        return ""
+    if hasattr(value, "item"):
+        return value.item()
+    return value
+
+def make_sheet_payload(saved):
+    """保存済み実戦1件を、シートの「結果」1行と「履歴」の行にする。"""
+    summary = saved["summary"]
+    result_row = [
+        saved["id"],
+        summary.get("保存名"),
+        summary.get("保存時刻"),
+        summary.get("累計回転"),
+        summary.get("単発回数"),
+        summary.get("確変突入回数"),
+        summary.get("使用玉数"),
+        summary.get("獲得玉数"),
+        summary.get("総当たり回数"),
+        summary.get("初当たり確率")
+        or first_hit_probability(summary.get("累計回転"), summary.get("初当たり回数")),
+        summary.get("差玉"),
+        summary.get("累計/k"),
+        summary.get("プレイ時間（保存まで）") or "−",
+        summary.get("プレイ時間（最後の1kまで）") or "−",
+        summary.get("ボーダー"),
+    ]
+    history_rows = []
+    for row in saved["detail"].to_dict(orient="records"):
+        history_rows.append([blank_if_missing(value) for value in [
+            saved["id"], row.get("保存名", summary.get("保存名")), row.get("記録No"), row.get("区間"),
+            row.get("区分"), row.get("投資k"), row.get("現在回転数"), row.get("今回1k"),
+            row.get("累計/k"), row.get("時刻"),
+        ]])
+    return {
+        "id": saved["id"],
+        "result": [blank_if_missing(value) for value in result_row],
+        "history": history_rows,
+    }
+
+def send_to_sheet(saved_list):
+    """未送信の実戦をスプレッドシートへ送り、送れた件数とエラー文を返す。"""
+    settings = sheet_settings()
+    targets = [saved for saved in saved_list if not saved["sent"]]
+    if not settings or not targets:
+        return 0, None
+    url, token = settings
+    try:
+        response = requests.post(
+            url,
+            json={"token": token, "sessions": [make_sheet_payload(saved) for saved in targets]},
+            timeout=30,
+        )
+        result = response.json()
+    except (requests.RequestException, ValueError):
+        return 0, "通信できませんでした。電波の良い場所で「未送信を送る」を押してください。"
+    if not result.get("ok"):
+        return 0, f"スプレッドシートが受け付けませんでした（{result.get('error', '不明なエラー')}）。"
+    received = set(result.get("saved", []))
+    for saved in targets:
+        if saved["id"] in received:
+            saved["sent"] = True
+    return len(received), None
+
+def store_send_notice(sent_count, error):
+    if error:
+        st.session_state.send_notice = ("error", error)
+    elif sent_count:
+        st.session_state.send_notice = ("success", f"スプレッドシートへ{sent_count}件送りました。")
 
 def reset_current_session():
     st.session_state.events = []
@@ -886,12 +997,17 @@ if latest is not None:
         detail_to_save.insert(0, "保存名", session_name)
         detail_to_save.insert(1, "保存時刻", now_text())
 
-        st.session_state.saved_sessions.append({
-            "summary": make_summary_record(
-                session_name, latest, result_data, float(border), st.session_state.events
-            ),
+        summary = make_summary_record(
+            session_name, latest, result_data, float(border), st.session_state.events
+        )
+        saved = {
+            "id": new_session_id(summary["保存時刻"]),
+            "sent": False,
+            "summary": summary,
             "detail": detail_to_save,
-        })
+        }
+        st.session_state.saved_sessions.append(saved)
+        store_send_notice(*send_to_sheet([saved]))
         st.session_state.reset_current_session = True
         st.rerun()
 
@@ -932,12 +1048,29 @@ if latest is not None:
 st.markdown("---")
 st.markdown("### 保存済みデータ")
 
+if send_notice := st.session_state.pop("send_notice", None):
+    level, message = send_notice
+    (st.error if level == "error" else st.success)(message)
+
 if not st.session_state.saved_sessions:
     st.caption("まだ保存済みデータはありません。")
 else:
     summaries = [s["summary"] for s in st.session_state.saved_sessions]
+    sheet_ready = sheet_settings() is not None
+    if sheet_ready:
+        unsent_count = sum(1 for s in st.session_state.saved_sessions if not s["sent"])
+        if st.button(
+            f"未送信を送る（{unsent_count}件）",
+            key="send_unsent_button",
+            use_container_width=True,
+            disabled=unsent_count == 0,
+            help="スプレッドシートへまだ送っていない実戦だけを送ります。送信済みの実戦は送りません。",
+        ):
+            with st.spinner("スプレッドシートへ送っています…"):
+                store_send_notice(*send_to_sheet(st.session_state.saved_sessions))
+            st.rerun()
     st.caption("新しい順に表示しています。プレイ時間は、時間の記録を始める前に保存した実戦では「−」になります。")
-    render_saved_session_cards(summaries)
+    render_saved_session_cards(st.session_state.saved_sessions, sheet_ready)
 
     summary_df = order_summary_columns(pd.DataFrame(summaries))
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
