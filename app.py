@@ -5,6 +5,7 @@ import altair as alt
 import html
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from streamlit_local_storage import LocalStorage
 
 st.set_page_config(
@@ -23,7 +24,7 @@ st.markdown("""
 h1 {
     font-size: 1.45rem !important;
 }
-h2, h3 {
+h2, h3, h4 {
     font-size: 1.05rem !important;
 }
 [data-testid="stMetricValue"] {
@@ -80,6 +81,36 @@ h2, h3 {
 .kc-saved .kc-metrics {
     margin: 0 0 4px;
 }
+.kc-result {
+    margin: 0.25rem 0 0.5rem;
+}
+.kc-result-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+    padding: 5px 2px;
+    border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+}
+.kc-result-label {
+    font-size: 0.9rem;
+}
+.kc-result-value {
+    font-size: 1.1rem;
+    font-weight: 700;
+    text-align: right;
+}
+.st-key-save_session_button button {
+    min-height: 3.2rem;
+    border-radius: 14px;
+}
+.st-key-reset_session_button {
+    margin-top: 2rem;
+}
+.st-key-save_session_button button p {
+    font-size: 1.1rem;
+    font-weight: 700;
+}
 .kc-judge {
     border-radius: 8px;
     padding: 8px 10px;
@@ -128,12 +159,14 @@ SUSPICIOUS_MAX_1K = 45
 CUTOFF_DIFF = 2.0
 # ボーダー差グラフの縦軸の幅（±回転）。超えた点は上端・下端に表示する。
 CHART_DIFF_RANGE = 5.0
+JST = ZoneInfo("Asia/Tokyo")
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOCAL_STORAGE_KEY = "kaiten_checker_draft_v1"
 SAVED_SESSIONS_STORAGE_KEY = "kaiten_checker_saved_sessions_v1"
 # 保存済みサマリーの列順。スマホで横スクロールせずに当たり・玉数が見えるよう前に置く。
 SUMMARY_COLUMNS = [
-    "保存名", "初当たり回数", "総当たり回数", "確変突入回数", "単発回数",
-    "使用玉数", "獲得玉数", "差玉",
+    "保存名", "初当たり回数", "総当たり回数", "確変突入回数", "単発回数", "初当たり確率",
+    "使用玉数", "獲得玉数", "差玉", "プレイ時間（保存まで）", "プレイ時間（最後の1kまで）",
     "累計投資k", "累計/k", "ボーダー", "ボーダー差（累計/k）", "直近5k", "直近10k",
     "開始回転数", "最終回転数", "累計回転", "保存時刻",
 ]
@@ -154,9 +187,49 @@ def normalize_events(events):
             continue
         if event_type == "1k" and (previous is None or value <= previous):
             continue
-        normalized.append({"type": event_type, "value": value})
+        event = {"type": event_type, "value": value}
+        if isinstance(raw.get("at"), str):
+            event["at"] = raw["at"]
+        normalized.append(event)
         previous = value
     return normalized
+
+def now_text():
+    """日本時間の現在時刻を保存用の文字列で返す（サーバーの時計がUTCでもずれない）。"""
+    return datetime.now(JST).strftime(TIME_FORMAT)
+
+def minutes_between(start_text, end_text):
+    try:
+        start = datetime.strptime(start_text, TIME_FORMAT)
+        end = datetime.strptime(end_text, TIME_FORMAT)
+    except (TypeError, ValueError):
+        return None
+    return max(0, int((end - start).total_seconds() // 60))
+
+def format_minutes(minutes):
+    if minutes is None:
+        return "−"
+    return f"{minutes // 60}時間{minutes % 60:02d}分"
+
+def play_times(events, end_text):
+    """最初の記録から、最後の1k確定までと、end_text（保存時刻）までのプレイ時間を返す。"""
+    events = normalize_events(events)
+    if not events or "at" not in events[0]:
+        return "−", "−"
+    start_text = events[0]["at"]
+    last_1k = next((event for event in reversed(events) if event["type"] == "1k"), None)
+    to_last_1k = minutes_between(start_text, last_1k.get("at")) if last_1k else None
+    return format_minutes(minutes_between(start_text, end_text)), format_minutes(to_last_1k)
+
+def first_hit_probability(total_rotation, first_hits):
+    try:
+        total_rotation = float(total_rotation)
+        first_hits = int(first_hits)
+    except (TypeError, ValueError):
+        return "−"
+    if first_hits <= 0:
+        return "−"
+    return f"1/{total_rotation / first_hits:.1f}"
 
 def migrate_v1_events(start_rotation, current_values):
     """旧版の開始回転数＋入力表を新しいイベント列へ変換する。"""
@@ -235,10 +308,15 @@ def calculate_all(events):
     history = pd.DataFrame(rows)
     return history, latest, history.copy()
 
-def make_summary_record(session_name, latest, result_data, border):
+def make_summary_record(session_name, latest, result_data, border, events):
+    saved_at = now_text()
+    to_save, to_last_1k = play_times(events, saved_at)
     return {
         "保存名": session_name,
-        "保存時刻": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "保存時刻": saved_at,
+        "プレイ時間（保存まで）": to_save,
+        "プレイ時間（最後の1kまで）": to_last_1k,
+        "初当たり確率": first_hit_probability(latest["累計回転"], result_data["初当たり回数"]),
         "ボーダー": round(border, 1) if border > 0 else None,
         "ボーダー差（累計/k）": round(float(latest["累計/k"]) - border, 2) if border > 0 else None,
         "開始回転数": int(latest["開始回転数"]),
@@ -263,51 +341,51 @@ def order_summary_columns(summary_df):
     others = [column for column in summary_df.columns if column not in SUMMARY_COLUMNS]
     return summary_df[known + others]
 
-def render_saved_session_cards(summaries):
-    """保存済み実戦を新しい順に、当たり・玉数が一目で分かるカードで表示する。"""
-    def number(value):
+def render_result_list(summary):
+    """転記しやすいよう、実戦結果を1項目1行で表示する。"""
+    def number(key):
         try:
-            number_value = float(value)
+            value = float(summary.get(key))
         except (TypeError, ValueError):
             return None
-        return None if number_value != number_value else number_value
+        return None if value != value else value
 
-    def card(label, value, value_class=""):
-        return (
-            f'<div class="kc-metric"><div class="kc-label">{label}</div>'
-            f'<div class="kc-value {value_class}">{value}</div></div>'
-        )
-
-    def count(summary, key, unit):
-        value = number(summary.get(key))
+    def count(key, unit):
+        value = number(key)
         return "−" if value is None else f"{int(value):,}{unit}"
 
-    for summary in reversed(summaries):
-        difference = number(summary.get("差玉"))
-        difference_class = "" if difference is None else ("kc-plus" if difference >= 0 else "kc-minus")
-        rate = number(summary.get("累計/k"))
-        border_diff = number(summary.get("ボーダー差（累計/k）"))
-        rate_class = "" if border_diff is None else ("kc-plus" if border_diff >= 0 else "kc-minus")
-        rate_text = "−" if rate is None else f"{rate:.2f}"
-        if border_diff is not None:
-            rate_text += f'<span class="kc-diff"> ({border_diff:+.2f})</span>'
+    difference = number("差玉")
+    rate = number("累計/k")
+    rows = [
+        ("総回転数", count("累計回転", "回転"), ""),
+        ("確変当たり回数", count("確変突入回数", "回"), ""),
+        ("単発当たり回数", count("単発回数", "回"), ""),
+        ("総当り回数", count("総当たり回数", "回"), ""),
+        ("初当たり確率", summary.get("初当たり確率")
+            or first_hit_probability(summary.get("累計回転"), summary.get("初当たり回数")), ""),
+        ("総投資玉数", count("使用玉数", "玉"), ""),
+        ("総回収玉数", count("獲得玉数", "玉"), ""),
+        ("差玉", "−" if difference is None else f"{int(difference):+,}玉",
+            "" if difference is None else ("kc-plus" if difference >= 0 else "kc-minus")),
+        ("回転率", "−" if rate is None else f"{rate:.2f} 回転/k", ""),
+        ("総プレイ時間（保存まで）", summary.get("プレイ時間（保存まで）") or "−", ""),
+        ("総プレイ時間（最後の1kまで）", summary.get("プレイ時間（最後の1kまで）") or "−", ""),
+    ]
+    rows_html = "".join(
+        f'<div class="kc-result-row"><span class="kc-result-label">{label}</span>'
+        f'<span class="kc-result-value {value_class}">{html.escape(str(value))}</span></div>'
+        for label, value, value_class in rows
+    )
+    return f'<div class="kc-result">{rows_html}</div>'
 
-        cards = [
-            card("初当たり", count(summary, "初当たり回数", "回")),
-            card("総当たり", count(summary, "総当たり回数", "回")),
-            card("確変／単発", f'{count(summary, "確変突入回数", "")}／{count(summary, "単発回数", "")}'),
-            card("使用玉数", count(summary, "使用玉数", "玉")),
-            card("獲得玉数", count(summary, "獲得玉数", "玉")),
-            card("差玉", "−" if difference is None else f"{int(difference):+,}玉", difference_class),
-            card("投資", count(summary, "累計投資k", "k")),
-            card("累計/k", rate_text, rate_class),
-            card("ボーダー", "−" if number(summary.get("ボーダー")) is None else f'{number(summary.get("ボーダー")):.1f}'),
-        ]
+def render_saved_session_cards(summaries):
+    """保存済み実戦を新しい順に、転記用の結果一覧で表示する。"""
+    for summary in reversed(summaries):
         st.markdown(
             f'<div class="kc-saved">'
             f'<div class="kc-saved-title">{html.escape(str(summary.get("保存名", "")))}</div>'
-            f'<div class="kc-saved-time">{html.escape(str(summary.get("保存時刻", "")))}</div>'
-            f'<div class="kc-metrics">{"".join(cards)}</div></div>',
+            f'<div class="kc-saved-time">保存：{html.escape(str(summary.get("保存時刻", "")))}</div>'
+            f'{render_result_list(summary)}</div>',
             unsafe_allow_html=True,
         )
 
@@ -315,7 +393,7 @@ def make_draft_payload():
     """入力途中の実戦をブラウザへ保存できる形にまとめる。"""
     return {
         "version": 2,
-        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "saved_at": now_text(),
         "session_name": st.session_state.get("session_name", "実戦1"),
         "events": normalize_events(st.session_state.get("events", [])),
         "first_hits": int(st.session_state.get("first_hits", 0)),
@@ -460,7 +538,7 @@ if restore_notice := st.session_state.pop("restore_notice", None):
 
 def append_event(event_type, value):
     """履歴へ1行追加し、次の数字をすぐ打てるよう入力欄を空にする。"""
-    st.session_state.events.append({"type": event_type, "value": int(value)})
+    st.session_state.events.append({"type": event_type, "value": int(value), "at": now_text()})
     st.session_state.pop("pending_1k", None)
     st.session_state.clear_rotation_input = True
     st.rerun()
@@ -783,24 +861,43 @@ if latest is not None:
         "差玉": ball_difference,
     }
 
-    save_col, reset_col = st.columns(2)
-    with save_col:
-        if st.button("この実戦を保存して次へ", disabled=not result_is_valid):
-            detail_to_save = calc_detail.copy()
-            detail_to_save.insert(0, "保存名", session_name)
-            detail_to_save.insert(1, "保存時刻", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    to_now, to_last_1k = play_times(st.session_state.events, now_text())
+    st.markdown("#### この実戦の結果")
+    st.markdown(
+        render_result_list({
+            **result_data,
+            "累計回転": int(latest["累計回転"]),
+            "累計/k": float(latest["累計/k"]),
+            "プレイ時間（保存まで）": to_now,
+            "プレイ時間（最後の1kまで）": to_last_1k,
+        }),
+        unsafe_allow_html=True,
+    )
+    st.caption("「保存まで」は今の時点までの時間です。保存ボタンを押した時刻で確定します。")
 
-            st.session_state.saved_sessions.append({
-                "summary": make_summary_record(session_name, latest, result_data, float(border)),
-                "detail": detail_to_save,
-            })
-            st.session_state.reset_current_session = True
-            st.rerun()
+    if st.button(
+        "この実戦を保存して次へ",
+        key="save_session_button",
+        type="primary",
+        use_container_width=True,
+        disabled=not result_is_valid,
+    ):
+        detail_to_save = calc_detail.copy()
+        detail_to_save.insert(0, "保存名", session_name)
+        detail_to_save.insert(1, "保存時刻", now_text())
 
-    with reset_col:
-        if st.button("保存せず入力をリセット"):
-            st.session_state.reset_current_session = True
-            st.rerun()
+        st.session_state.saved_sessions.append({
+            "summary": make_summary_record(
+                session_name, latest, result_data, float(border), st.session_state.events
+            ),
+            "detail": detail_to_save,
+        })
+        st.session_state.reset_current_session = True
+        st.rerun()
+
+    if st.button("保存せず入力をリセット", key="reset_session_button"):
+        st.session_state.reset_current_session = True
+        st.rerun()
 
     show_graph = st.checkbox("グラフを表示する", value=False)
 
@@ -839,7 +936,7 @@ if not st.session_state.saved_sessions:
     st.caption("まだ保存済みデータはありません。")
 else:
     summaries = [s["summary"] for s in st.session_state.saved_sessions]
-    st.caption("新しい順に表示しています。累計/kの（　）内はボーダー差です（緑：プラス、赤：マイナス）。")
+    st.caption("新しい順に表示しています。プレイ時間は、時間の記録を始める前に保存した実戦では「−」になります。")
     render_saved_session_cards(summaries)
 
     summary_df = order_summary_columns(pd.DataFrame(summaries))
